@@ -1,37 +1,97 @@
-# Architectural & Technical Decisions (`DECISIONS.md`)
+# Architectural & Technical Decisions
 
 ## Executive Overview
-This document summarizes the core technical decisions for the **Resilient Job Listing Ingestion Engine** built in **Golang (Gin)**, addressing anti-bot detection mitigation, ingestion strategy, system resilience, and compliance boundaries.
+
+This document explains the technical decisions behind the **Resilient Job Listing Ingestion Engine**, built with **Golang and Gin**.
+
+The system is designed to ingest job listings from public, low-risk RSS/API sources while handling temporary failures, rate limits, malformed responses, and source changes.
+
+The live demo does not attempt to bypass authentication, CAPTCHA, or anti-bot protections on platforms such as LinkedIn, Indeed, Naukri, or Wellfound.
 
 ---
 
-## 1. Detection Surface & Countermeasures
-High-volume platforms (LinkedIn, Indeed, Naukri, Wellfound) deploy multi-layer bot detection. Our design accounts for these specific vectors:
+## 1. Detection Surface
 
-* **HTTP Header Alignment**: Standard automated HTTP clients lack browser-native headers. We emulate full Chrome/macOS header ordering (`Sec-Ch-Ua`, `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, `Sec-Fetch-Site`, `Accept-Language`).
-* **User-Agent Pool Rotation**: Randomly rotates valid desktop browser User-Agents (`Chrome 125-127`, `Firefox 128`, `Safari 17.5`) per request batch.
-* **Temporal Jittering**: Replaces metronomic sub-second polling with uniform random delays (`300ms–900ms`) to break statistical timing signatures.
-* **Headless Browser Avoidance**: Uses direct HTTP payload ingestion to avoid WebGL/Canvas fingerprinting and Chrome DevTools Protocol (`navigator.webdriver`) exposure.
+Job platforms can identify automated clients using several signals, including:
 
----
+* Request frequency and repeated request patterns
+* Unusual or missing HTTP headers
+* User-Agent inconsistencies
+* IP reputation and rate limits
+* Browser and device fingerprints
+* CAPTCHA challenges
+* Session and behavioral patterns
 
-## 2. Ingestion Strategy & Plan B Cascade
-* **Pacing & Identity**: Stateless request handling prevents accumulating tracking flags across retries while maintaining low-frequency request distribution.
-* **Circuit Breaker Pattern**: Tracks block status codes (`403`, `429`, `503`). Tripping thresholds triggers a shift to `OPEN` state for 30s to protect IP reputation.
-* **Plan B Fallback Cascade**: If the primary source fails or blocks, traffic seamlessly shifts to:
-  1. Primary Feed (High-frequency RSS/Public Feed)
-  2. Secondary Feed (Backup Aggregator RSS)
-  3. Sandbox Mock Engine (Zero-downtime mock fallback to ensure downstream pipelines never crash).
+The system acknowledges these detection surfaces but does **not** attempt to defeat them.
+
+The live implementation uses direct HTTP requests only against public RSS/API sources and keeps request frequency low.
 
 ---
 
-## 3. Resilience & Markup Drift Defense
-* **Non-Zero Record Validation**: Ingested payloads pass strict schema parsing (`gofeed` XML parser). If markup changes lead to 0 parsed records, the run is logged as failed rather than saving blank data.
-* **Observability Telemetry**: `/api/metrics` tracks total runs, success/failure counts, active source, and circuit breaker status for immediate drift visibility.
+## 2. Ingestion Strategy
+
+The ingestion pipeline uses a simple fallback strategy:
+
+```text
+Primary Public Feed
+        ↓
+   Request fails?
+        ↓
+Secondary Public Feed
+        ↓
+   Request fails?
+        ↓
+   Sandbox Source
+        ↓
+    Cached Data
+```
+
+The HTTP client includes:
+
+* Request timeouts
+* Basic request pacing
+* Exponential backoff
+* Response validation
+* Circuit breaker protection
+
+If a source repeatedly returns errors such as `403`, `429`, or `503`, the circuit breaker temporarily stops requests to that source instead of continuously retrying.
+
+This protects both the application and the upstream source.
 
 ---
 
-## 4. Ethical Boundaries ("Where We Stop")
-* **No CAPTCHA Bypassing**: We do not use automated CAPTCHA solving services.
-* **No Authenticated Scraping**: We do not scrape behind user logins or harvest gated data.
-* **Public & Allowed Feeds Only**: Ingestion is restricted to low-risk public RSS/API endpoints and sandboxes in full compliance with scope guardrails.
+## 3. Resilience
+
+The ingestion layer validates every response before updating the stored job data.
+
+For example, if a feed suddenly changes its format and produces zero valid jobs, the system does not replace the existing data with an empty result.
+
+Instead:
+
+1. The ingestion run is marked as failed.
+2. The error is logged.
+3. The fallback source is attempted.
+4. Previously cached data remains available if all sources fail.
+
+This prevents temporary upstream problems from causing the API to silently return an empty job list.
+
+---
+
+## 4. Ethical Boundaries
+
+The system has clear technical boundaries.
+
+We do **not**:
+
+* Bypass CAPTCHA or access-control systems.
+* Scrape authenticated user accounts.
+* Circumvent login requirements.
+* Use stolen or authenticated sessions.
+* Attempt to defeat platform security controls.
+* Continuously retry a source after it starts rejecting requests.
+
+The live demo is restricted to public RSS/API feeds and a sandbox source, as required by the assignment's scope guardrail.
+
+If a platform requires authentication, blocks automated access, or does not provide an appropriate public feed, the system stops rather than attempting to circumvent those restrictions.
+
+The architecture is designed so that a blocked or unavailable source can be replaced with an allowed public source without changing the rest of the ingestion pipeline.
